@@ -43,7 +43,7 @@ class SiglipVisionEmbeddings(nn.Module):
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            padding="valid",  # This indicates no padding is added
+            padding="valid", # This indicates no padding is added
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -55,12 +55,11 @@ class SiglipVisionEmbeddings(nn.Module):
             persistent=False,
         )
     
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
         _, _, height, width = pixel_values.shape # [Batch_Size, Channels, Height, Width]
         # convolve the patch_Size kernal over the image, with no overlapping patches
         # The output of the convolution will have shape [Batch_Size, Embed_Dim, Height//Patch_Size, Width//Patch_Size]
         patch_embeds = self.patch_embedding(pixel_values)
-
         # [Batch_Size, Embed_Dim, Height//Patch_Size, Width//Patch_Size] -> [Batch_Size, Embed_Dim, Num_Patches]
         # where Num_Patches = Height//Patch_Size * Width//Patch_Size
         embeddings = patch_embeds.flatten(2)
@@ -69,22 +68,10 @@ class SiglipVisionEmbeddings(nn.Module):
         embeddings = embeddings + self.position_embedding(self.position_ids)
         return embeddings
 
-class SiglipMLP(nn.Module):
-    def __init__(self, config: SiglipVisionConfig):
-        super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.gelu = nn.GELU(approximate="tanh")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x) # x: [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Intermediate_Size]
-        x = self.gelu(x)
-        x = self.fc2(x) # [Batch_Size, Num_Patches, Intermediate_Size] -> [Batch_Size, Num_Patches, Embed_Dim]
-        return x
 
 class SiglipAttention(nn.Module):
-    def __init__(self, config: SiglipVisionConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -97,9 +84,8 @@ class SiglipAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        
 
-    def foward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # x : [Batch_Size, Num_Patches, Embed_Dim]
         batch_size, seq_len, _ = x.size()
 
@@ -113,30 +99,57 @@ class SiglipAttention(nn.Module):
 
         # attn: [Batch_Size, Num_Heads, Num_Patches, Head_Dim] * [Batch_Size, Num_Heads, Head_Dim, Num_Patches] -> [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
         attn_weights = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype) # [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
-        
-        # apply only during training
+        if attn_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(batch_size, self.num_heads, seq_len, seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+        # Apply the softmax row-wise. attn_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype) 
+        # Apply dropout only during training
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-        
-        x = torch.matmul(attn_weights, v) # [Batch_Size, Num_Heads, Num_Patches, Num_Patches] * [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
-        x = x.transpose(1, 2).contiguous # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim] 
-        x = x.reshape(batch_size, seq_len, self.embed_dim) # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        x = self.out_proj(x)
-        return x, attn_weights
+        # [Batch_Size, Num_Heads, Num_Patches, Num_Patches] * [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
+        attn_output = torch.matmul(attn_weights, v) 
+        if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+        # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim] 
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
+        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, attn_weights
+    
+class SiglipMLP(nn.Module):
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.gelu = nn.GELU(approximate="tanh")
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Intermediate_Size]
+        x = self.fc1(x)
+        x = self.gelu(x)
+        # [Batch_Size, Num_Patches, Intermediate_Size] -> [Batch_Size, Num_Patches, Embed_Dim]
+        x = self.fc2(x)
+        return x
 
 class SiglipEncoderLayer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
-        self.embed_dim = config.hidden_size  # 嵌入维度，从配置中获取隐藏层大小
-        self.self_attn = SiglipAttention(config)  # 自注意力机制模块
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)  # 第一个层归一化层
-        self.mlp = SiglipMLP(config)  # 多层感知机模块
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)  # 第二个层归一化层
+        self.embed_dim = config.hidden_size
+        self.self_attn = SiglipAttention(config)
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.mlp = SiglipMLP(config)
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [Batch_Size, Num_Patches, Embed_Dim] - 输入张量的维度说明
-        x_residual = x  # 保存输入的残差连接
+        x_residual = x
         x = self.layer_norm1(x)   # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         x, _ = self.self_attn(x)  # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         x = x_residual + x
@@ -152,7 +165,9 @@ class SiglipEncoder(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for encoder_layer in self.layers:

@@ -1,7 +1,6 @@
-import torch 
+import torch
 from torch import nn
 from typing import Optional, Tuple, List
-from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 
@@ -14,25 +13,40 @@ class KVCache():
         if len(self.key_cache) == 0:
             return 0
         else:
-            # the shape of the key_cache is [batch_size, num_heads_KV, seq_len, head_dim]
+            # The shape of the key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
             return self.key_cache[0].shape[-2]
-    
-    def update(self, key: torch.Tensor, value: torch.Tensor, layer_idx):
+
+    def update(self, key: torch.Tensor, value: torch.Tensor, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if len(self.key_cache) <= layer_idx:
-            # if we never added anything to KVCache of this layer, let us create it
+            # If we never added anything to the KV-Cache of this layer, let's create it.
             self.key_cache.append(key)
             self.value_cache.append(value)
         else:
-            # otherwise we concatenate the new keys with existing ones.
-            # each tensor has shape: [batch_size, num_heads_KV, seq_len, head_dim]
+            # ... otherwise we concatenate the new keys with the existing ones.
+            # each tensor has shape: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value], dim=-2)
-        
+        # ... and then we return all the existing keys + the new ones.
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
-class GemmaConfig:
-    def __init__(self, vocab_size, hidden_size, intermediate_size, num_hidden_layers, num_attention_heads, num_key_value_heads, 
-                 head_dim=256, max_position_embeddings=8192, rms_norm_eps=1e-6,
-                 rope_theta=10000.0, attention_bias=False, attention_dropout=0.0, pad_token_id=None, **kwargs):
+class GemmaConfig():
+    def __init__(
+            self,
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim=256,
+            max_position_embeddings=8192,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+            pad_token_id=None,
+            **kwargs,
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -47,20 +61,18 @@ class GemmaConfig:
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
-        self.is_encoder_decoder = False
 
-
-class PaliGemmaConfig:
+class PaliGemmaConfig():
     def __init__(self, vision_config=None, text_config=None, ignore_index=-100, image_token_index=256000, vocab_size=257152, projection_dim=2048, hidden_size=2048, pad_token_id=None, **kwargs):
-        super.__init__()
+        super().__init__()
         self.ignore_index = ignore_index
         self.image_token_index = image_token_index
         self.vocab_size = vocab_size
         self.projection_dim = projection_dim
         self.hidden_size = hidden_size
-        self.pad_token_id = pad_token_id
         self.vision_config = vision_config
         self.is_encoder_decoder = False
+        self.pad_token_id = pad_token_id
 
         self.vision_config = SiglipVisionConfig(**vision_config)
         self.text_config = text_config
@@ -74,18 +86,67 @@ class PaliGemmaConfig:
 class GemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.w = nn.Parameter(torch.zeros(dim))
         self.eps = eps
-
+        self.weight = nn.Parameter(torch.zeros(dim))
+        
     def norm_(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         output = self.norm_(x.float())
-        # llama does x.to(float16) * w while gemma is (x * w).to(float16)
-        output = output * (1.0 + self.w.float())
+        # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
+class GemmaRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim  # set to the head_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        # calculate the theta according to the formula theta_i = base ^ (2i/dim) where i = 0, 1, ..., dim//2
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids, seq_len=None):
+        # x: [batch_size, num_attention_heads, seq_len, head_size]
+        # self.inv_freq.to(x.device)
+
+        # copy the inv_freq tensor for batch in the sequence
+        # [dim//2] -> [1, dim//2, 1] -> [batch_size, head_dim // 2, 1]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        
+        # [batch_size, seq_len] -> [batch_size, 1, seq_len]
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            # multiply each theta by the position (which is the argument of sin and cos functions)
+            # freqs: [batch_size, head_dim // 2, 1] @ [batch_size, 1, seq_len] -> [batch_size, seq_len, head_dim//2]
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            # emb: [batch_size, seq_len, head_dim]
+            emb = torch.cat((freqs, freqs), dim=-1)
+            # cos, sin [batch_size, seq_len, head_dim]
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
+def rotate_half(x):
+    # Build the [-x2, x1, -x4, x3, ...] tensor for the sin part of the positional encoding.
+    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
+    sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
+    # Apply the formula (34) of the Rotary Positional Encoding paper.
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 class GemmaMLP(nn.Module):
     def __init__(self, config: GemmaConfig):
@@ -100,19 +161,19 @@ class GemmaMLP(nn.Module):
     def forward(self, x):
         # 这是 Gemma / LLaMA 系列模型中 SwiGLU 激活函数的等效实现
         # Equivalent to:
-        # y = self.gate_proj(x)  # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # y = torch.gelu(y, approximate="tanh")  # [Batch_Size, Seq_Len, Intermediate_Size]
-        # j = self.up_proj(x)  # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = y * j  # [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = self.down_proj(z)  # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
+        # y = self.gate_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
+        # y = torch.gelu(y, approximate="tanh") # [Batch_Size, Seq_Len, Intermediate_Size]
+        # j = self.up_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
+        # z = y * j # [Batch_Size, Seq_Len, Intermediate_Size]
+        # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
-def repeat_kv(hidden_state: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_state.shape
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
-        return hidden_state
-    hidden_state = hidden_state[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_state.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class GemmaAttention(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
@@ -142,10 +203,8 @@ class GemmaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        self.rotary_emb = RotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta)
+        self.rotary_emb = GemmaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta)
 
-        
-    
     def forward(self,
                 hidden_state: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
@@ -185,27 +244,26 @@ class GemmaAttention(nn.Module):
         assert attention_mask is not None
         attn_weights = attn_weights + attention_mask
 
-        # [batch_size, num_heads_Q, seq_len, seq_len]
+        # Apply the softmax
+        # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         # [batch_size, num_heads_Q, seq_len, seq_len] * [batch_size, num_heads_Q, seq_len, head_dim] -> [batch_size, num_heads_Q, seq_len, head_dim]
-        output = torch.matmul(attn_weights, v)
+        attn_output = torch.matmul(attn_weights, v)
+        if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
         # [batch_size, num_heads_Q, seq_len, head_dim] -> [batch_size, seq_len, num_heads_Q, head_dim]
-        output = output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(1, 2).contiguous()
         # [batch_size, seq_len, num_heads_Q, head_dim] -> [batch_size, seq_len, num_heads_Q * head_dim]
-        output = output.view(batch_size, seq_len, -1)
+        attn_output = attn_output.view(batch_size, seq_len, -1)
         # [batch_size, seq_len, num_heads_Q * head_dim] -> [batch_size, seq_len, hidden_size]
-        output = self.o_proj(output)
-        return output, attn_weights
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
         
-        
-
-    def forward(self, 
-                hidden_state: torch.Tensor, 
-                attention_mask: Optional[torch.Tensor] = None, 
-                position_ids: Optional[torch.LongTensor] = None,
-                kv_cache: Optional[KVCache] = None,):
 
 
 class GemmaDecoderLayer(nn.Module):
@@ -218,8 +276,8 @@ class GemmaDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     
     def forward(self, 
-                hidden_state: torch.Tensor, 
-                attention_mask: Optional[torch.Tensor] = None, 
+                hidden_state: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.LongTensor] = None,
                 kv_cache: Optional[KVCache] = None,):
         residual = hidden_state
@@ -249,7 +307,9 @@ class GemmaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self):
@@ -294,8 +354,8 @@ class GemmaForCausalLM(nn.Module):
                 position_ids: Optional[torch.LongTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None, 
                 kv_cache: Optional[KVCache] = None,) -> Tuple:
-        # input_embeds: [batch_size, seq_len, hidden_size]
-        # outputs: [batch_size, seq_len, hidden_size]
+        # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
+        # outputs: [Batch_Size, Seq_Len, Hidden_Size]
         outputs = self.model(attention_mask, position_ids, inputs_embeds, kv_cache)
         hidden_states = outputs
         logits = self.lm_head(hidden_states).float()
@@ -315,7 +375,6 @@ class PaliGemmaMultiModalProjector(nn.Module):
         # [batch_size, num_patches, embed_dim] -> [batch_size, num_patches, projection_dim]
         hidden_states = self.linear(image_features)
         return hidden_states
-
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -347,11 +406,11 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # shape: [batch_size, seq_len]. true for image tokens
         image_mask = (input_ids == self.config.image_token_index)
         # shape: [batch_size, seq_len]. true for padding tokens
-        padding_mask = (input_ids == self.pad_token_id)
+        pad_mask = (input_ids == self.pad_token_id)
 
         # we need to expand the masks to the embedding dimension otherwise we cannot use them in torch.where
         text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
-        padding_mask_expanded = padding_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
 
         # add the text embedding
@@ -359,25 +418,29 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # insert image embeddings. we cannot use torch.where because the sequence length of scaled_image_features is not equal to sequence length of final embeddngs
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         # zero out padding tokens
-        final_embedding = torch.where(padding_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
+        final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
 
         ## create the attention mask ##
 
         dtype, device = inputs_embeds.dtype, inputs_embeds.device
-        min_dtype = torch.finfo(dtype).min
+        # min_dtype = torch.finfo(dtype).min
         q_len = inputs_embeds.shape[1]
 
         if kv_cache is None or kv_cache.num_items() == 0:
             # do not mask any token, because we are in the prefill phase
             # this only works when we have no padding
-            causal_mask = torch.full((batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device)
+            causal_mask = torch.full(
+                (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
+            )
         else:
             # since we are generating tokens, the query must be one single token
             assert q_len == 1
             kv_len = kv_cache.num_items() + q_len
             # also in this case we do not need to mask anything , since each query should be able to attend all previous
             # this only works when we have no padding
-            causal_mask = torch.full((batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device)
+            causal_mask = torch.full(
+                (batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device
+            )
 
         # add head dimension
         # [batch_size, q_len, kv_len] -> [batch_size, num_heads_q, q_len, kv_len]
@@ -405,16 +468,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         assert torch.all(attention_mask == 1), "The input cannot be padded"
         # 1. extra the input embeddings
         # shape: (batch_size, seq_len, hidden_size)
-        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         # 2. merge text and images
         # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
-        selected_image_feature = self.vision_tower(pixel_values.to(input_embeds.dtype))
+        selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Seq_Len, hidden_size]
         image_features = self.multi_modal_projector(selected_image_feature)
 
         # 3. merge the embeddings of text tokens and image tokens
-        inputs_embeds, attention_mask, position_ids = self._merge_ids_with_image_features(image_features, input_embeds, input_ids, attention_mask, kv_cache)
+        inputs_embeds, attention_mask, position_ids = self._merge_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
 
         outputs = self.language_model(attention_mask=attention_mask, position_ids=position_ids, inputs_embeds=inputs_embeds, kv_cache=kv_cache)
         return outputs
