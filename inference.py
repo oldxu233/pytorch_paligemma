@@ -4,7 +4,6 @@
 "export HF_ENDPOINT=https://hf-mirror.com"
 "huggingface-cli download google/paligemma-3b-pt-224 --local-dir /home/xqzzz1/codes/pytorch-paligemma/paligemma-3b-model"
 
-
 from PIL import Image
 import torch
 from processing_paligemma import PaliGemmaProcessor

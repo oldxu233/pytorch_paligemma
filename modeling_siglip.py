@@ -122,6 +122,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
         return attn_output, attn_weights
     
+    
 class SiglipMLP(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()

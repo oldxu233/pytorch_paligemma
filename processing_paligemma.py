@@ -17,6 +17,7 @@ def add_image_tokens_to_prompt(prefix_prompt, bos_token, image_seq_len: int, ima
     # 参见 HF 实现代码：https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f3657
     return f"{image_token * image_seq_len}{bos_token}{prefix_prompt}\n"
 
+
 def rescale(image: np.ndarray, scale: float, dtype: np.dtype = np.float32) -> np.ndarray:
     rescaled_image = image * scale
     return rescaled_image.astype(dtype)

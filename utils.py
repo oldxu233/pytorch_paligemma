@@ -5,6 +5,7 @@ import glob
 from safetensors import safe_open
 import os
 
+
 def load_hf_model(model_path: str, device: str):
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
